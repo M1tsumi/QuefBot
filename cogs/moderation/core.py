@@ -13,9 +13,468 @@ from services.permissions import PermissionGuard, has_guild_permissions, bot_has
 from services.audit import log_moderation_action
 
 
+class LockControlView(discord.ui.View):
+    def __init__(self, channel: discord.TextChannel, reason: Optional[str]) -> None:
+        super().__init__(timeout=60)
+        self.channel_id = channel.id
+        self.guild_id = channel.guild.id
+        self.reason = reason
+
+    async def _apply_lock(self, interaction: discord.Interaction, duration_seconds: Optional[int]) -> None:
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.response.edit_message(content="Could not resolve channel for lock.", view=None)
+            return
+        channel = guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.edit_message(content="This command can only be used in text channels.", view=None)
+            return
+        overwrite = channel.overwrites_for(guild.default_role)
+        overwrite.send_messages = False
+        try:
+            await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=self.reason)
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to update channel permissions.", view=None)
+            return
+        try:
+            await channel.send("This channel has been locked by staff.")
+        except discord.HTTPException:
+            pass
+        await log_moderation_action(interaction, "Lock", target=None, reason=self.reason)
+        client = interaction.client
+        if duration_seconds is not None and isinstance(client, QuefBot) and client.scheduler is not None:
+            delay = max(1, duration_seconds)
+
+            async def unlock_later() -> None:
+                g = client.get_guild(self.guild_id)
+                if g is None:
+                    return
+                c = g.get_channel(self.channel_id)
+                if not isinstance(c, discord.TextChannel):
+                    return
+                overwrite2 = c.overwrites_for(g.default_role)
+                overwrite2.send_messages = None
+                try:
+                    await c.set_permissions(g.default_role, overwrite=overwrite2, reason="Timed lock expired")
+                except discord.HTTPException:
+                    return
+
+            client.scheduler.schedule(f"lock:{self.guild_id}:{self.channel_id}", delay, unlock_later)
+        for item in self.children:
+            item.disabled = True
+        summary = f"{channel.mention} has been locked."
+        if duration_seconds is not None:
+            minutes = duration_seconds // 60
+            summary = f"{channel.mention} has been locked for {minutes} minute(s)."
+        await interaction.response.edit_message(content=summary, view=self)
+
+    @discord.ui.button(label="Lock 5 minutes", style=discord.ButtonStyle.primary)
+    async def lock_5_minutes(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_lock(interaction, 5 * 60)
+
+    @discord.ui.button(label="Lock 1 hour", style=discord.ButtonStyle.primary)
+    async def lock_1_hour(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_lock(interaction, 60 * 60)
+
+    @discord.ui.button(label="Lock until unlocked", style=discord.ButtonStyle.secondary)
+    async def lock_until_unlocked(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_lock(interaction, None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Lock cancelled.", view=self)
+
+
+class UnlockControlView(discord.ui.View):
+    def __init__(self, channel: discord.TextChannel) -> None:
+        super().__init__(timeout=60)
+        self.channel_id = channel.id
+        self.guild_id = channel.guild.id
+
+    async def _apply_unlock(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.response.edit_message(content="Could not resolve channel for unlock.", view=None)
+            return
+        channel = guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.edit_message(content="This command can only be used in text channels.", view=None)
+            return
+        overwrite = channel.overwrites_for(guild.default_role)
+        overwrite.send_messages = None
+        try:
+            await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Channel unlocked")
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to update channel permissions.", view=None)
+            return
+        try:
+            await channel.send("This channel has been unlocked by staff.")
+        except discord.HTTPException:
+            pass
+        await log_moderation_action(interaction, "Unlock", target=None, reason="Channel unlocked")
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=f"{channel.mention} has been unlocked.", view=self)
+
+    @discord.ui.button(label="Unlock now", style=discord.ButtonStyle.success)
+    async def unlock_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_unlock(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Unlock cancelled.", view=self)
+
+
+class KickConfirmView(discord.ui.View):
+    def __init__(self, cog: "Moderation", member: discord.Member, reason: Optional[str]) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.member_id = member.id
+        self.reason = reason
+
+    @discord.ui.button(label="Confirm kick", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.edit_message(content="This command can only be used in a guild.", view=None)
+            return
+        member = guild.get_member(self.member_id)
+        if member is None:
+            await interaction.response.edit_message(content="Member is no longer in the guild.", view=None)
+            return
+        try:
+            await guild.kick(user=member, reason=self.reason)
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to kick member.", view=None)
+            return
+        self.cog._record_punishment(interaction, member, "Kick", reason=self.reason)
+        await log_moderation_action(interaction, "Kick", target=member, reason=self.reason)
+        await self.cog._send_meme_message(interaction, member, "Kick")
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=f"{member} has been kicked.", view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Kick cancelled.", view=self)
+
+
+class BanConfirmView(discord.ui.View):
+    def __init__(self, cog: "Moderation", member: discord.Member, reason: Optional[str]) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.member_id = member.id
+        self.reason = reason
+
+    @discord.ui.button(label="Confirm ban", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.edit_message(content="This command can only be used in a guild.", view=None)
+            return
+        member = guild.get_member(self.member_id)
+        if member is None:
+            await interaction.response.edit_message(content="Member is no longer in the guild.", view=None)
+            return
+        try:
+            await guild.ban(user=member, reason=self.reason, delete_message_days=0)
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to ban member.", view=None)
+            return
+        self.cog._record_punishment(interaction, member, "Ban", reason=self.reason)
+        await log_moderation_action(interaction, "Ban", target=member, reason=self.reason)
+        await self.cog._send_meme_message(interaction, member, "Ban")
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=f"{member} has been banned.", view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Ban cancelled.", view=self)
+
+
+class WarnControlView(discord.ui.View):
+    def __init__(self, cog: "Moderation", member: discord.Member, base_reason: Optional[str]) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.member_id = member.id
+        self.base_reason = base_reason
+
+    async def _apply_warn(self, interaction: discord.Interaction, severity: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.edit_message(content="This command can only be used in a guild.", view=None)
+            return
+        member = guild.get_member(self.member_id)
+        if member is None:
+            await interaction.response.edit_message(content="Member is no longer in the guild.", view=None)
+            return
+        parts = [f"[{severity}]"]
+        if self.base_reason:
+            parts.append(self.base_reason)
+        reason = " ".join(parts).strip()
+        self.cog._record_punishment(interaction, member, "Warn", reason=reason or None)
+        await log_moderation_action(interaction, "Warn", target=member, reason=reason or None)
+        try:
+            dm_text = reason or "You have been warned by the staff."
+            await member.send(f"You have been warned in {guild.name}: {dm_text}")
+        except discord.HTTPException:
+            pass
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"{member.mention} has been warned (severity: {severity}).",
+            view=self,
+        )
+
+    @discord.ui.button(label="Info", style=discord.ButtonStyle.secondary)
+    async def warn_info(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_warn(interaction, "Info")
+
+    @discord.ui.button(label="Minor", style=discord.ButtonStyle.primary)
+    async def warn_minor(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_warn(interaction, "Minor")
+
+    @discord.ui.button(label="Major", style=discord.ButtonStyle.danger)
+    async def warn_major(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_warn(interaction, "Major")
+
+
+class TimeoutControlView(discord.ui.View):
+    def __init__(self, cog: "Moderation", member: discord.Member, base_minutes: int, base_reason: Optional[str]) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.member_id = member.id
+        self.base_minutes = max(1, base_minutes)
+        self.base_reason = base_reason
+
+    async def _set_timeout(self, interaction: discord.Interaction, minutes: Optional[int]) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.edit_message(content="This command can only be used in a guild.", view=None)
+            return
+        member = guild.get_member(self.member_id)
+        if member is None:
+            await interaction.response.edit_message(content="Member is no longer in the guild.", view=None)
+            return
+        try:
+            if minutes is None:
+                await member.timeout(None, reason="Timeout cleared via control panel")
+                message = f"Timeout cleared for {member.mention}."
+            else:
+                effective = max(1, minutes)
+                delta = datetime.timedelta(minutes=effective)
+                await member.timeout(delta, reason="Timeout adjusted via control panel")
+                message = f"Timeout set to {effective} minute(s) for {member.mention}."
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to update timeout.", view=None)
+            return
+        scheduler = self.cog.bot.scheduler
+        if minutes is not None and scheduler is not None:
+            delay = max(1, minutes * 60)
+
+            async def clear_timeout() -> None:
+                try:
+                    await member.timeout(None, reason="Timeout expired (adjusted)")
+                except discord.HTTPException:
+                    pass
+
+            scheduler.schedule(f"timeout:{member.id}", delay, clear_timeout)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=message, view=self)
+
+    @discord.ui.button(label="Shorten", style=discord.ButtonStyle.secondary)
+    async def shorten(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        new_minutes = max(1, self.base_minutes // 2)
+        await self._set_timeout(interaction, new_minutes)
+
+    @discord.ui.button(label="Extend +5m", style=discord.ButtonStyle.primary)
+    async def extend(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        new_minutes = self.base_minutes + 5
+        await self._set_timeout(interaction, new_minutes)
+
+    @discord.ui.button(label="Clear now", style=discord.ButtonStyle.danger)
+    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._set_timeout(interaction, None)
+
+
+class MuteControlView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "Moderation",
+        guild_id: int,
+        member_id: int,
+        mute_role_id: int,
+        base_minutes: Optional[int],
+        base_reason: Optional[str],
+    ) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.member_id = member_id
+        self.mute_role_id = mute_role_id
+        self.base_minutes = base_minutes
+        self.base_reason = base_reason
+
+    async def _get_member_role(
+        self,
+        interaction: discord.Interaction,
+    ) -> Optional[tuple[discord.Guild, discord.Member, Optional[discord.Role]]]:
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.response.edit_message(content="This command can only be used in a guild.", view=None)
+            return None
+        member = guild.get_member(self.member_id)
+        if member is None:
+            await interaction.response.edit_message(content="Member is no longer in the guild.", view=None)
+            return None
+        role = guild.get_role(self.mute_role_id)
+        return guild, member, role
+
+    @discord.ui.button(label="Unmute now", style=discord.ButtonStyle.success)
+    async def unmute_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        result = await self._get_member_role(interaction)
+        if result is None:
+            return
+        guild, member, role = result
+        if role is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Mute cleared via control panel")
+            except discord.HTTPException:
+                await interaction.response.edit_message(content="Failed to remove mute role.", view=None)
+                return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=f"Mute cleared for {member.mention}.", view=self)
+
+    @discord.ui.button(label="Convert to 10m timeout", style=discord.ButtonStyle.danger)
+    async def convert_to_timeout(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        result = await self._get_member_role(interaction)
+        if result is None:
+            return
+        guild, member, role = result
+        if role is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Converted mute to timeout via control panel")
+            except discord.HTTPException:
+                await interaction.response.edit_message(content="Failed to remove mute role.", view=None)
+                return
+        try:
+            delta = datetime.timedelta(minutes=10)
+            await member.timeout(delta, reason="Converted mute to timeout via control panel")
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to apply timeout.", view=None)
+            return
+        scheduler = self.cog.bot.scheduler
+        if scheduler is not None:
+            async def clear_timeout() -> None:
+                try:
+                    await member.timeout(None, reason="Timeout expired (from mute conversion)")
+                except discord.HTTPException:
+                    pass
+
+            scheduler.schedule(f"timeout:{member.id}", 10 * 60, clear_timeout)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"Converted mute to a 10 minute timeout for {member.mention}.",
+            view=self,
+        )
+
+
+class JailControlView(discord.ui.View):
+    def __init__(self, cog: "Moderation", guild_id: int, user_id: int, role_id: int) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.role_id = role_id
+
+    @discord.ui.button(label="Pardon now", style=discord.ButtonStyle.success)
+    async def pardon_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        guild = interaction.guild
+        if guild is None or guild.id != self.guild_id:
+            await interaction.response.edit_message(content="This command can only be used in a guild.", view=None)
+            return
+        member = guild.get_member(self.user_id)
+        role = guild.get_role(self.role_id)
+        if member is not None and role is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Pardon: clearing jail state via control panel")
+            except discord.HTTPException:
+                await interaction.response.edit_message(content="Failed to remove jail role.", view=None)
+                return
+        # Clear jail state in history if present
+        self.cog.bot.history.clear_jail(guild.id, self.user_id)
+        if member is not None:
+            self.cog._record_punishment(
+                interaction,
+                member,
+                "Pardon",
+                reason="Cleared jail via control panel",
+            )
+        await log_moderation_action(
+            interaction,
+            "Pardon",
+            target=member if member is not None else None,
+            reason="Cleared jail via control panel",
+        )
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="Jail state cleared for the user.",
+            view=self,
+        )
+
+
 class Moderation(commands.Cog, PermissionGuard):
     def __init__(self, bot: QuefBot) -> None:
         self.bot = bot
+
+    async def _send_meme_message(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        action: str,
+        duration_minutes: Optional[int] = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        get_log_channel = getattr(self.bot, "get_log_channel", None)
+        if get_log_channel is None:
+            return
+        channel = get_log_channel(guild)
+        if channel is None:
+            return
+        if action == "Ban":
+            text = f"Get pwned, {member.mention}!"
+        elif action == "Mute":
+            text = f"{member.mention} has been silenced. (Muted)"
+        elif action == "Kick":
+            text = f"{member.mention} just got kicked out of the server."
+        elif action == "Timeout":
+            if duration_minutes is not None and duration_minutes > 0:
+                text = f"{member.mention} has been put in timeout for {duration_minutes} minute(s)."
+            else:
+                text = f"{member.mention} has been put in timeout."
+        elif action == "Jail":
+            text = f"{member.mention} has been thrown in jail."
+        else:
+            text = f"{member.mention} has received action: {action}."
+        try:
+            await channel.send(text)
+        except discord.HTTPException:
+            return
 
     def _record_punishment(
         self,
@@ -60,12 +519,12 @@ class Moderation(commands.Cog, PermissionGuard):
     @has_guild_permissions(manage_messages=True)
     async def warn(self, interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None) -> None:
         await self.ensure_target_hierarchy(interaction, member)
-        message = f"{member.mention} has been warned."
+        message = f"Preparing to warn {member.mention}."
         if reason:
-            message += f" Reason: {reason}"
-        await interaction.response.send_message(message, ephemeral=True, view=ResponseView())
-        self._record_punishment(interaction, member, "Warn", reason=reason)
-        await log_moderation_action(interaction, "Warn", target=member, reason=reason)
+            message += f" Proposed reason: {reason}"
+        message += " Choose a severity below to confirm."
+        view = WarnControlView(self, member, reason)
+        await interaction.response.send_message(message, ephemeral=True, view=view)
 
     @app_commands.command(name="note", description="Attach a private moderator note to a member")
     @is_staff()
@@ -92,10 +551,11 @@ class Moderation(commands.Cog, PermissionGuard):
             duration_minutes = 1
         delta = datetime.timedelta(minutes=duration_minutes)
         await member.timeout(delta, reason=reason)
+        view = TimeoutControlView(self, member, duration_minutes, reason)
         await interaction.response.send_message(
-            f"{member.mention} has been timed out for {duration_minutes} minutes.",
+            f"{member.mention} has been timed out for {duration_minutes} minutes. Use the buttons below to adjust or clear the timeout.",
             ephemeral=True,
-            view=ResponseView(),
+            view=view,
         )
         await log_moderation_action(
             interaction,
@@ -111,6 +571,7 @@ class Moderation(commands.Cog, PermissionGuard):
             reason=reason,
             duration_seconds=int(delta.total_seconds()),
         )
+        await self._send_meme_message(interaction, member, "Timeout", duration_minutes=duration_minutes)
         scheduler = self.bot.scheduler
         if scheduler is not None:
             async def clear_timeout() -> None:
@@ -171,7 +632,8 @@ class Moderation(commands.Cog, PermissionGuard):
                         except discord.HTTPException:
                             pass
                 scheduler.schedule(f"mute:{guild.id}:{member.id}", duration_seconds, remove_mute)
-        await interaction.response.send_message("".join(parts), ephemeral=True, view=ResponseView())
+        view = MuteControlView(self, guild.id, member.id, mute_role_id, duration_minutes, reason)
+        await interaction.response.send_message("".join(parts), ephemeral=True, view=view)
         self._record_punishment(
             interaction,
             member,
@@ -186,6 +648,7 @@ class Moderation(commands.Cog, PermissionGuard):
             reason=reason,
             duration_seconds=duration_seconds if duration_seconds is not None else None,
         )
+        await self._send_meme_message(interaction, member, "Mute", duration_minutes=duration_minutes)
 
     @app_commands.command(name="kick", description="Kick a member from the server")
     @is_staff()
@@ -197,14 +660,11 @@ class Moderation(commands.Cog, PermissionGuard):
         if guild is None:
             await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
             return
-        await guild.kick(user=member, reason=reason)
-        await interaction.response.send_message(
-            f"{member} has been kicked.",
-            ephemeral=True,
-            view=ResponseView(),
-        )
-        self._record_punishment(interaction, member, "Kick", reason=reason)
-        await log_moderation_action(interaction, "Kick", target=member, reason=reason)
+        view = KickConfirmView(self, member, reason)
+        text = f"Are you sure you want to kick {member.mention}?"
+        if reason:
+            text += f" Reason: {reason}"
+        await interaction.response.send_message(text, ephemeral=True, view=view)
 
     @app_commands.command(name="ban", description="Ban a member from the server")
     @is_staff()
@@ -217,14 +677,11 @@ class Moderation(commands.Cog, PermissionGuard):
         if guild is None:
             await interaction.response.send_message("This command can only be used in a guild.", ephemeral=True)
             return
-        await guild.ban(user=member, reason=reason, delete_message_days=0)
-        await interaction.response.send_message(
-            f"{member} has been banned.",
-            ephemeral=True,
-            view=ResponseView(),
-        )
-        self._record_punishment(interaction, member, "Ban", reason=reason)
-        await log_moderation_action(interaction, "Ban", target=member, reason=reason)
+        view = BanConfirmView(self, member, reason)
+        text = f"Are you sure you want to ban {member.mention}?"
+        if reason:
+            text += f" Reason: {reason}"
+        await interaction.response.send_message(text, ephemeral=True, view=view)
 
     @app_commands.command(name="softban", description="Ban and immediately unban a member to remove messages")
     @is_staff()
@@ -299,12 +756,14 @@ class Moderation(commands.Cog, PermissionGuard):
         )
         self.bot.history.set_jail(state)
         self._record_punishment(interaction, member, "Jail", reason=reason)
+        view = JailControlView(self, guild.id, member.id, jail_role.id)
         await interaction.response.send_message(
-            f"{member.mention} has been jailed with role {jail_role.mention}.",
+            f"{member.mention} has been jailed with role {jail_role.mention}. Use the button below to quickly pardon if needed.",
             ephemeral=True,
-            view=ResponseView(),
+            view=view,
         )
         await log_moderation_action(interaction, "Jail", target=member, reason=reason)
+        await self._send_meme_message(interaction, member, "Jail")
 
     @app_commands.command(name="purge", description="Bulk delete messages in the current channel")
     @is_staff()
@@ -358,15 +817,12 @@ class Moderation(commands.Cog, PermissionGuard):
         if guild is None or not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
             return
-        overwrite = channel.overwrites_for(guild.default_role)
-        overwrite.send_messages = False
-        await channel.set_permissions(guild.default_role, overwrite=overwrite, reason=reason)
+        view = LockControlView(channel, reason)
         await interaction.response.send_message(
-            f"{channel.mention} has been locked.",
+            f"Configure lock duration for {channel.mention}.",
             ephemeral=True,
-            view=ResponseView(),
+            view=view,
         )
-        await log_moderation_action(interaction, "Lock", target=None, reason=reason)
 
     @app_commands.command(name="unlock", description="Unlock the current channel for @everyone")
     @is_staff()
@@ -378,15 +834,12 @@ class Moderation(commands.Cog, PermissionGuard):
         if guild is None or not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("This command can only be used in text channels.", ephemeral=True)
             return
-        overwrite = channel.overwrites_for(guild.default_role)
-        overwrite.send_messages = None
-        await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Channel unlocked")
+        view = UnlockControlView(channel)
         await interaction.response.send_message(
-            f"{channel.mention} has been unlocked.",
+            f"Confirm unlocking {channel.mention}.",
             ephemeral=True,
-            view=ResponseView(),
+            view=view,
         )
-        await log_moderation_action(interaction, "Unlock", target=None, reason="Channel unlocked")
 
     @app_commands.command(name="pardon", description="Clear active mute/jail/ban state for a user")
     @is_staff()

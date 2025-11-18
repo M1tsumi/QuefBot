@@ -58,3 +58,10 @@ class IncidentStore:
             (status, updated_at, incident_id),
         )
         return self.get_incident(incident_id)
+
+    def delete_incident(self, incident_id: int) -> bool:
+        cur = self._db.execute(
+            "DELETE FROM incidents WHERE id = ?",
+            (incident_id,),
+        )
+        return cur.rowcount > 0

@@ -36,3 +36,12 @@ class AutoRoleStore:
             (guild_id,),
         )
         return {str(row["trigger"]): int(row["role_id"]) for row in rows}
+
+    def clear_trigger(self, guild_id: int, trigger: str) -> None:
+        trigger = trigger.lower().strip()
+        if not trigger:
+            return
+        self._db.execute(
+            "DELETE FROM auto_roles WHERE guild_id = ? AND trigger = ?",
+            (guild_id, trigger),
+        )

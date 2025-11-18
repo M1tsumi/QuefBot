@@ -238,6 +238,187 @@ class TicketOpenView(discord.ui.View):
         )
 
 
+class IncidentCreateView(discord.ui.View):
+    def __init__(self, cog: "Ops", title: str, description: str) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.title = title
+        self.description = description
+
+    @discord.ui.button(label="Create incident", style=discord.ButtonStyle.primary)
+    async def create_incident(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        incident = self.cog.bot.incidents.create_incident(self.title, self.description, interaction.user.id)
+        lines = [
+            f"Incident #{incident.id} created.",
+            f"Title: {incident.title}",
+            f"Description: {incident.description}",
+            f"Status: {incident.status}",
+            f"Created by: <@{incident.created_by}>",
+            f"Created at: {incident.created_at:%Y-%m-%d %H:%M UTC}",
+        ]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="\n".join(lines), view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Incident creation cancelled.", view=self)
+
+
+class IncidentStatusView(discord.ui.View):
+    def __init__(self, cog: "Ops", incident_id: int) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.incident_id = incident_id
+
+    def _format_incident(self, incident) -> str:
+        return "\n".join(
+            [
+                f"Incident #{incident.id}",
+                f"Title: {incident.title}",
+                f"Description: {incident.description}",
+                f"Status: {incident.status}",
+                f"Created by: <@{incident.created_by}>",
+                f"Created at: {incident.created_at:%Y-%m-%d %H:%M UTC}",
+                f"Last updated: {incident.updated_at:%Y-%m-%d %H:%M UTC}",
+            ]
+        )
+
+    async def _set_status(self, interaction: discord.Interaction, status: str) -> None:
+        updated = self.cog.bot.incidents.set_status(self.incident_id, status)
+        if updated is None:
+            await interaction.response.edit_message(content="Incident not found.", view=None)
+            return
+        for item in self.children:
+            item.disabled = False
+        await interaction.response.edit_message(content=self._format_incident(updated), view=self)
+
+    @discord.ui.button(label="Open", style=discord.ButtonStyle.secondary)
+    async def set_open(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._set_status(interaction, "open")
+
+    @discord.ui.button(label="Investigating", style=discord.ButtonStyle.primary)
+    async def set_investigating(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._set_status(interaction, "investigating")
+
+    @discord.ui.button(label="Resolved", style=discord.ButtonStyle.success)
+    async def set_resolved(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._set_status(interaction, "resolved")
+
+
+class IncidentDeleteView(discord.ui.View):
+    def __init__(self, cog: "Ops", incident_id: int, title: str) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.incident_id = incident_id
+        self.title = title
+
+    @discord.ui.button(label="Confirm delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        deleted = self.cog.bot.incidents.delete_incident(self.incident_id)
+        if not deleted:
+            await interaction.response.edit_message(content="Incident could not be deleted (it may have been removed already).", view=None)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"Incident #{self.incident_id} ('{self.title}') deleted.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Incident deletion cancelled.", view=self)
+
+
+class TicketEscalateView(discord.ui.View):
+    def __init__(self, cog: "Ops", ticket_id: int, current_priority: str) -> None:
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.ticket_id = ticket_id
+        self.current_priority = current_priority
+
+    async def _apply_priority(self, interaction: discord.Interaction, priority: str) -> None:
+        ticket = self.cog.bot.tickets.get_ticket(self.ticket_id)
+        if ticket is None:
+            await interaction.response.edit_message(content="Ticket not found.", view=None)
+            return
+        ticket = self.cog.bot.tickets.escalate_ticket(self.ticket_id, priority, interaction.user.id)
+        await log_moderation_action(
+            interaction,
+            "Ticket Escalate",
+            target=None,
+            reason=f"Escalated ticket #{ticket.id} to priority '{ticket.priority}'",
+        )
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"Ticket #{ticket.id} escalated to '{ticket.priority}'.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Low", style=discord.ButtonStyle.secondary)
+    async def set_low(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_priority(interaction, "low")
+
+    @discord.ui.button(label="Medium", style=discord.ButtonStyle.primary)
+    async def set_medium(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_priority(interaction, "medium")
+
+    @discord.ui.button(label="High", style=discord.ButtonStyle.primary)
+    async def set_high(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_priority(interaction, "high")
+
+    @discord.ui.button(label="Critical", style=discord.ButtonStyle.danger)
+    async def set_critical(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        await self._apply_priority(interaction, "critical")
+
+
+class TicketConfigView(discord.ui.View):
+    def __init__(self, bot: QuefBot, guild_id: int, category_id: int) -> None:
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.guild_id = guild_id
+        self.category_id = category_id
+
+    @discord.ui.button(label="Send test ticket panel here", style=discord.ButtonStyle.primary)
+    async def send_test_panel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:  # type: ignore[override]
+        guild = interaction.guild
+        channel = interaction.channel
+        if guild is None or guild.id != self.guild_id or not isinstance(channel, discord.TextChannel):
+            await interaction.response.edit_message(
+                content="This button can only be used in a text channel in the configured guild.",
+                view=None,
+            )
+            return
+        category = guild.get_channel(self.category_id)
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.edit_message(
+                content="Ticket category is misconfigured. Run `/ticket config` again.",
+                view=None,
+            )
+            return
+        embed = discord.Embed(
+            title="Support Tickets",
+            description="Click **Open Ticket** to create a private channel with the staff team.",
+            colour=discord.Colour.blurple(),
+        )
+        embed.set_footer(text="Use this for support, appeals, or other private matters.")
+        view = TicketOpenView()
+        try:
+            await channel.send(embed=embed, view=view)
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="Failed to send test ticket panel.", view=None)
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content=f"Test ticket panel sent in {channel.mention}.", view=self)
+
+
 def _resolve_extension_name(name: str) -> str:
     name = name.strip()
     if not name:
@@ -343,16 +524,16 @@ class Ops(commands.Cog):
     @is_staff()
     @app_commands.describe(title="Short title for the incident", description="Detailed description of the incident")
     async def incident_create(self, interaction: discord.Interaction, title: str, description: str) -> None:
-        incident = self.bot.incidents.create_incident(title, description, interaction.user.id)
-        embed = discord.Embed(
-            title=f"Incident #{incident.id}: {incident.title}",
-            description=incident.description,
-            colour=discord.Colour.red(),
-            timestamp=incident.created_at,
-        )
-        embed.add_field(name="Status", value=incident.status, inline=True)
-        embed.add_field(name="Created By", value=f"<@{incident.created_by}>", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True, view=ResponseView())
+        lines = [
+            "Previewing new incident:",
+            f"Title: {title}",
+            f"Description: {description}",
+            f"Requested by: {interaction.user.mention}",
+            "",
+            "Use the buttons below to create or cancel.",
+        ]
+        view = IncidentCreateView(self, title, description)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True, view=view)
 
     @incident_group.command(name="status", description="Get the status of an incident")
     @is_staff()
@@ -366,15 +547,36 @@ class Ops(commands.Cog):
                 view=ResponseView(),
             )
             return
-        embed = discord.Embed(
-            title=f"Incident #{incident.id}: {incident.title}",
-            description=incident.description,
-            colour=discord.Colour.red(),
-            timestamp=incident.updated_at,
+        lines = [
+            f"Incident #{incident.id}",
+            f"Title: {incident.title}",
+            f"Description: {incident.description}",
+            f"Status: {incident.status}",
+            f"Created by: <@{incident.created_by}>",
+            f"Created at: {incident.created_at:%Y-%m-%d %H:%M UTC}",
+            f"Last updated: {incident.updated_at:%Y-%m-%d %H:%M UTC}",
+        ]
+        view = IncidentStatusView(self, incident.id)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True, view=view)
+
+    @incident_group.command(name="delete", description="Delete an existing incident")
+    @is_staff()
+    @app_commands.describe(incident_id="ID of the incident to delete")
+    async def incident_delete(self, interaction: discord.Interaction, incident_id: int) -> None:
+        incident = self.bot.incidents.get_incident(incident_id)
+        if incident is None:
+            await interaction.response.send_message(
+                "Incident not found.",
+                ephemeral=True,
+                view=ResponseView(),
+            )
+            return
+        content = (
+            f"Are you sure you want to delete Incident #{incident.id}: '{incident.title}'? "
+            "This cannot be undone."
         )
-        embed.add_field(name="Status", value=incident.status, inline=True)
-        embed.add_field(name="Created By", value=f"<@{incident.created_by}>", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True, view=ResponseView())
+        view = IncidentDeleteView(self, incident.id, incident.title)
+        await interaction.response.send_message(content, ephemeral=True, view=view)
 
     ticket_group = app_commands.Group(name="ticket", description="Ticket queue commands")
 
@@ -387,13 +589,28 @@ class Ops(commands.Cog):
         ticket_id: int,
         priority: Optional[str] = None,
     ) -> None:
-        effective_priority = priority or "medium"
-        ticket = self.bot.tickets.escalate_ticket(ticket_id, effective_priority, interaction.user.id)
-        await interaction.response.send_message(
-            f"Ticket #{ticket.id} escalated with priority '{ticket.priority}'.",
-            ephemeral=True,
-            view=ResponseView(),
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This command can only be used in a guild.",
+                ephemeral=True,
+                view=ResponseView(),
+            )
+            return
+        ticket = self.bot.tickets.get_ticket(ticket_id)
+        if ticket is None:
+            await interaction.response.send_message(
+                "Ticket not found.",
+                ephemeral=True,
+                view=ResponseView(),
+            )
+            return
+        content = (
+            f"Ticket #{ticket.id} (status: {ticket.status}, priority: {ticket.priority}). "
+            "Choose a new priority below to escalate."
         )
+        view = TicketEscalateView(self, ticket.id, ticket.priority)
+        await interaction.response.send_message(content, ephemeral=True, view=view)
 
     @ticket_group.command(name="config", description="Configure where ticket channels are created")
     @is_staff()
@@ -408,11 +625,12 @@ class Ops(commands.Cog):
             )
             return
         self.bot.tickets.set_category(guild.id, category.id)
-        await interaction.response.send_message(
-            f"Ticket category set to {category.mention}.",
-            ephemeral=True,
-            view=ResponseView(),
+        content = (
+            f"Ticket category set to {category.mention}. "
+            "Use the button below to send a test ticket panel in this channel."
         )
+        view = TicketConfigView(self.bot, guild.id, category.id)
+        await interaction.response.send_message(content, ephemeral=True, view=view)
 
     @ticket_group.command(name="panel", description="Send a ticket panel with an Open Ticket button")
     @is_staff()
@@ -504,8 +722,19 @@ class Ops(commands.Cog):
                 view=ResponseView(),
             )
             return
+        result_repr = repr(result)
+        if len(result_repr) > 1000:
+            result_repr = result_repr[:1000] + "...(truncated)"
+        expression_block = f"```py\n{expression}\n```"
+        result_block = f"```py\n{result_repr}\n```"
+        embed = discord.Embed(
+            title="Debug eval result",
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(name="Expression", value=expression_block, inline=False)
+        embed.add_field(name="Result", value=result_block, inline=False)
         await interaction.response.send_message(
-            f"Result: {result!r}",
+            embed=embed,
             ephemeral=True,
             view=ResponseView(),
         )

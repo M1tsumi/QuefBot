@@ -23,6 +23,12 @@ class ReactionRoleStore:
             (guild_id, message_id),
         )
 
+    def clear_mapping(self, guild_id: int, message_id: int, emoji: str) -> None:
+        self._db.execute(
+            "DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ? AND emoji = ?",
+            (guild_id, message_id, emoji),
+            )
+
     def get_mappings_for_message(self, guild_id: int, message_id: int) -> Dict[str, int]:
         rows = self._db.query_all(
             "SELECT emoji, role_id FROM reaction_roles WHERE guild_id = ? AND message_id = ?",

@@ -25,24 +25,45 @@ class Diagnostics(commands.Cog):
         lines = []
         for key, value in data.items():
             lines.append(f"{key}: {value}")
-        content = "Resolved configuration:\n" + "\n".join(lines)
-        await interaction.response.send_message(content, ephemeral=True, view=ResponseView())
+        description = "```ini\n" + "\n".join(lines) + "\n```"
+        embed = discord.Embed(
+            title="Resolved configuration",
+            description=description,
+            colour=discord.Colour.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, view=ResponseView())
 
     @app_commands.command(name="health", description="Show basic bot health information")
     @is_staff()
     async def health(self, interaction: discord.Interaction) -> None:
         latency_ms = round(self.bot.latency * 1000)
         guild_count = len(self.bot.guilds)
-        content = f"Latency: {latency_ms} ms\nGuilds: {guild_count}"
-        await interaction.response.send_message(content, ephemeral=True, view=ResponseView())
+        uptime_seconds = int(time.time() - self.process_start)
+        embed = discord.Embed(
+            title="Bot health",
+            colour=discord.Colour.green(),
+        )
+        embed.add_field(name="Latency", value=f"{latency_ms} ms", inline=True)
+        embed.add_field(name="Guilds", value=str(guild_count), inline=True)
+        embed.add_field(name="Uptime", value=f"{uptime_seconds} seconds", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True, view=ResponseView())
 
     @app_commands.command(name="bot-stats", description="Show runtime statistics for the bot")
     @is_staff()
     async def runtime_stats(self, interaction: discord.Interaction) -> None:
         uptime_seconds = int(time.time() - self.process_start)
         shard_count = self.bot.shard_count or 1
-        content = f"Uptime: {uptime_seconds} seconds\nShards: {shard_count}"
-        await interaction.response.send_message(content, ephemeral=True, view=ResponseView())
+        guild_count = len(self.bot.guilds)
+        latency_ms = round(self.bot.latency * 1000)
+        embed = discord.Embed(
+            title="Bot statistics",
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(name="Uptime", value=f"{uptime_seconds} seconds", inline=True)
+        embed.add_field(name="Shards", value=str(shard_count), inline=True)
+        embed.add_field(name="Guilds", value=str(guild_count), inline=True)
+        embed.add_field(name="Latency", value=f"{latency_ms} ms", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True, view=ResponseView())
 
     @app_commands.command(name="audit-history", description="Show punishment history for a user")
     @is_staff()
@@ -68,15 +89,26 @@ class Diagnostics(commands.Cog):
         if not records:
             await interaction.response.send_message("No history found.", ephemeral=True, view=ResponseView())
             return
+        embed = discord.Embed(
+            title="Audit history",
+            colour=discord.Colour.blurple(),
+        )
+        if user is None:
+            target_label = "All users"
+        else:
+            target_label = f"User: {user} ({user.id})"
         lines = []
         for record in records:
             reason = record.reason or "None"
             lines.append(
-                f"{record.created_at.isoformat()} | action={record.action} | user={record.user_id} | "
+                f"{record.created_at:%Y-%m-%d %H:%M} - {record.action} | user={record.user_id} | "
                 f"moderator={record.moderator_id} | reason={reason}"
             )
-        content = "Audit history:\n" + "\n".join(lines)
-        await interaction.response.send_message(content, ephemeral=True, view=ResponseView())
+        embed.description = "\n".join(lines)
+        count = len(records)
+        plural = "entry" if count == 1 else "entries"
+        embed.set_footer(text=f"{target_label} | Showing {count} {plural}")
+        await interaction.response.send_message(embed=embed, ephemeral=True, view=ResponseView())
 
     @app_commands.command(name="member-info", description="Show moderation summary for a member")
     @is_staff()
@@ -92,9 +124,16 @@ class Diagnostics(commands.Cog):
             title=f"Member info: {member}",
             colour=discord.Colour.blurple(),
         )
+        embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="User ID", value=str(member.id), inline=True)
         embed.add_field(name="Infractions", value=str(len(punishments)), inline=True)
         embed.add_field(name="Notes", value=str(len(notes)), inline=True)
+        created_at = getattr(member, "created_at", None)
+        joined_at = getattr(member, "joined_at", None)
+        if created_at is not None:
+            embed.add_field(name="Account created", value=created_at.strftime("%Y-%m-%d"), inline=True)
+        if joined_at is not None:
+            embed.add_field(name="Joined server", value=joined_at.strftime("%Y-%m-%d"), inline=True)
         roles = [role.mention for role in member.roles if role.name != "@everyone"]
         embed.add_field(name="Roles", value=" ".join(roles) or "None", inline=False)
         punishments_preview = punishments[-3:]
@@ -159,8 +198,18 @@ class Diagnostics(commands.Cog):
             ])
         buffer.seek(0)
         file = discord.File(fp=io.BytesIO(buffer.getvalue().encode("utf-8")), filename="moderation_logs.csv")
+        punishments_count = len(punishments)
+        notes_count = len(notes)
+        embed = discord.Embed(
+            title="Moderation logs export",
+            description=(
+                f"Exported {punishments_count} punishment record(s) "
+                f"and {notes_count} note(s) to CSV."
+            ),
+            colour=discord.Colour.blurple(),
+        )
         await interaction.response.send_message(
-            "Exported moderation logs.",
+            embed=embed,
             ephemeral=True,
             file=file,
             view=ResponseView(),
